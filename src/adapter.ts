@@ -84,6 +84,8 @@ export function createWorkBuddyAdapter(opts: WbAdapterOptions = {}): Adapter {
     displayName: 'WorkBuddy',
     defaultPort: 8786,
     upstreamLabel: `${baseUrl}  (OpenAI 兼容 · 官方桌面端指纹)`,
+    /* 帮助文本里 login 那一行的说明（本工具是 OAuth，不是读客户端登录态）。 */
+    loginHint: '登录（官方 OAuth 设备授权；按提示在浏览器完成授权）',
 
     extraCommands: [
       {

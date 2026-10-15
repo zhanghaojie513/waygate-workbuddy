@@ -1,6 +1,6 @@
 {
   "name": "waygate-workbuddy",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "WorkBuddy 本地反代：按官方桌面端指纹出站，提供 OpenAI/Anthropic 兼容的本地聊天端点",
   "keywords": [
     "workbuddy",
@@ -45,7 +45,7 @@
     "dev": "node --experimental-strip-types src/index.ts"
   },
   "dependencies": {
-    "waygate-core": "^0.2.4"
+    "waygate-core": "^0.2.5"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
