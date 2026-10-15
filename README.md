@@ -13,22 +13,22 @@
 
 </div>
 
-读取本机 WorkBuddy 桌面端的登录态，在本机起一个 **OpenAI / Anthropic 兼容**的聊天端点，
+用你的 WorkBuddy 账号登录一次（官方 OAuth 通道），在本机起一个 **OpenAI / Anthropic 兼容**的聊天端点，
 供 Cursor / Claude Code / Cherry Studio 等客户端直连。只在本机读写与转发，不上传任何数据。
 
 ## 快速开始
 
-**要求**：Node.js ≥ 20；本机装有 WorkBuddy 桌面端**且已登录**。
+**要求**：Node.js ≥ 20（**不需要**装 WorkBuddy 桌面端）。
 
 ```bash
 # 全局安装（之后命令就是 wb）
 npm i -g waygate-workbuddy
 
-# ① 从客户端登录态导出（客户端登录态是加密的，需借客户端运行时解密一次）
-node "$(npm root -g)/waygate-workbuddy/tools/wb-oauth-export.mjs"
+# ① 登录：打印授权链接（浏览器打开、用你的 WorkBuddy 账号完成登录）
+wb login
 
-# ② 导入
-wb import wb-oauth.json
+# ② 完成登录：回来取 token
+wb login-poll
 
 # ③ 启动
 wb
@@ -37,16 +37,18 @@ wb
 启动后终端会打印**模型 ID 与代理地址**，把它们填进你的客户端即可。
 
 > [!NOTE]
-> 导入的 `wb-oauth.json` **等同账号登录态** —— 别提交进版本库，导入后删掉本地副本。
+> 登录走 **WorkBuddy 官方给插件/CLI 的 OAuth 设备授权通道** —— 不读本机客户端文件、不做任何解密。
+> 登录态只保存在本机 `~/.waygate/wb/credential.json`（权限 0600），不会上传。
 
 ## 命令
 
 ```bash
 wb                       # 启动反代（同 wb serve），打印模型 ID 与代理地址
 wb models                # 只列出模型 ID（不起服务）
+wb login                 # 登录第 ① 步：打印授权链接
+wb login-poll            # 登录第 ② 步：浏览器授权后取 token
 wb checkin               # 签到代领 + 跑成长任务 + 连登兑换
 wb status                # 只查签到状态（不领取）
-wb import <文件>      # 导入客户端登录态
 wb doctor                # 自检：端口 / 登录态 / 模型清单 / 上游连通 / 令牌刷新
 ```
 
@@ -86,7 +88,7 @@ flowchart LR
   W -->|"② 满足上游硬约束<br/>（见下）"| U
   U -.->|"SSE（本就是 OpenAI 格式，直接透传）"| W
   W -.-> C
-  L["本机客户端登录态<br/>（加密，导出一次即可）"] -.-> W
+  L["官方 OAuth 设备授权<br/>（wb login 一次）"] -.-> W
 ```
 
 **上游本身就是 OpenAI 兼容** —— 所以没有协议翻译层，出站 SSE 直接透传。
@@ -108,12 +110,14 @@ flowchart LR
 
 ## 常见问题
 
-**Q：为什么不能直接用 API 密钥（`ck_`）？**
-A：实测桌面端登录态可打通聊天/清单/签到全部链路，一处凭证够了；不必让用户去后台自签密钥。
-（若你的场景确实需要 `ck_`，本工具的指纹与改写模块可直接复用 —— 它们与凭证无关。）
+**Q：登录走的是什么通道？**
+A：WorkBuddy **官方给插件/CLI 的 OAuth 设备授权**（）。
+不读本机客户端文件、不做任何解密 —— 与那些「读桌面端加密登录态」的工具性质不同。
+（本仓库也**不含任何解密代码**：指纹与改写模块与凭证获取完全解耦。）
 
 **Q：登录态过期了怎么办？**
-A：约 28 天。重跑一次导出 + 导入即可（两条命令）。`wb doctor` 会显示剩余时长。
+A：access 约 28 天，本工具**提前 2 天自动刷新**并写回，通常无需人工干预。
+若 refresh 也失效（如在其他设备登出），重跑 `wb login` + `wb login-poll` 即可。`wb doctor` 会显示剩余时长。
 
 **Q：`checkin` 报「未完成」的任务？**
 A：那是任务的前置条件没满足（多为「体验 XX」型）。工具**如实记 `skipped`，不伪造行为去凑**。

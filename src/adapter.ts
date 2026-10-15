@@ -12,19 +12,19 @@
  * 桌面端 OAuth accessToken 可打通聊天 / 模型清单 / 签到 / 代领 —— 不需要 `ck_` 密钥。
  */
 
-import { existsSync, readFileSync } from 'node:fs';
 import { type Adapter, type ChatRequestBody, type CredentialStatus, type ModelEntry, type UpstreamCallResult } from 'waygate-core';
 import { UpstreamError } from './errors.js';
 import { buildUpstreamHeaders } from './headers.js';
 import { rewriteRequestBody, type PromptRewriteMode } from './rewrite.js';
 import {
+  PendingLoginError,
   WbTokenManager,
-  clientAuthFile,
   credentialPath,
   credentialSummary,
-  importCredentialFrom,
+  pollLogin,
   readSavedCredential,
-  wbHeaders,
+  startLogin,
+  wbCommonHeaders,
   type WbCredential,
 } from './credential.js';
 import { WbActivity, renderRunAll, renderSigninPanel } from './activity.js';
@@ -64,28 +64,20 @@ export function createWorkBuddyAdapter(opts: WbAdapterOptions = {}): Adapter {
       throw new UpstreamError('未导入 WorkBuddy 登录态 —— 先跑 `wb login`（见 README）。');
     }
     const token = await tokens.accessToken();
-    /* 复用 headers.ts 的指纹构造，再把 Bearer 换成登录态令牌。 */
-    const { headers, leaked } = buildUpstreamHeaders({}, cred.accessToken, spoof, userAgent);
+    /* 指纹头（headers.ts）+ 登录态域公共头（credential.ts）：两者共同构成官方客户端形态。 */
+    const { headers, leaked } = buildUpstreamHeaders({}, token, spoof, userAgent);
     if (leaked.length > 0) {
       throw new UpstreamError(`内部错误：出站头残留敏感头 ${leaked.join(', ')}`);
     }
-    headers['authorization'] = `Bearer ${token}`;
-    /* 登录态域还要求稳定设备头与 x-user-id（领取族必需）。 */
-    const credHeaders = wbHeaders(cred, token);
-    headers['x-machine-id'] = credHeaders['x-machine-id']!;
-    headers['x-session-id'] = credHeaders['x-session-id']!;
-    headers['x-user-id'] = credHeaders['x-user-id']!;
-    return { ...headers, ...extra };
+    const common = wbCommonHeaders(token);
+    delete common['content-type'];
+    delete common['x-requested-with'];
+    headers['x-user-id'] = cred.uid;
+    if (cred.enterpriseId) headers['x-enterprise-id'] = cred.enterpriseId;
+    if (cred.domain) headers['x-domain'] = cred.domain;
+    return { ...headers, ...common, ...extra };
   }
 
-  /** 导入登录态（import 与其别名共用）。 */
-  async function importRun({ args }: { args: string[] }): Promise<string> {
-    const file = args[0];
-    if (!file) throw new Error('用法：wb import <导出文件.json>（用 tools/wb-oauth-export.mjs 生成）');
-    const payload = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
-    importCredentialFrom(payload);
-    return `已导入登录态 → ${credentialPath()}\n${credentialSummary()}`;
-  }
 
   return {
     command: 'wb',
@@ -94,6 +86,22 @@ export function createWorkBuddyAdapter(opts: WbAdapterOptions = {}): Adapter {
     upstreamLabel: `${baseUrl}  (OpenAI 兼容 · 官方桌面端指纹)`,
 
     extraCommands: [
+      {
+        name: 'login-poll',
+        summary: '完成登录：轮询取 token（浏览器授权后执行）',
+        usage: 'login-poll',
+        async run() {
+          try {
+            const cred = await pollLogin();
+            return '登录成功 → ' + credentialPath() + '\n' + credentialSummary();
+          } catch (err) {
+            if (err instanceof PendingLoginError) {
+              return '⏳ 尚未完成授权 —— 请先在浏览器里完成登录，然后重跑：wb login-poll';
+            }
+            throw err;
+          }
+        },
+      },
       {
         name: 'checkin',
         summary: '签到代领 + 跑成长任务（用本工具维护的登录态）',
@@ -112,12 +120,6 @@ export function createWorkBuddyAdapter(opts: WbAdapterOptions = {}): Adapter {
           return json ? JSON.stringify(p, null, 2) : renderSigninPanel(p);
         },
       },
-      {
-        name: 'import',
-        summary: '导入客户端登录态（wb-oauth-export.mjs 的输出）',
-        usage: 'import <文件>',
-        run: importRun,
-      },
     ],
 
     async credentialStatus(): Promise<CredentialStatus> {
@@ -126,36 +128,25 @@ export function createWorkBuddyAdapter(opts: WbAdapterOptions = {}): Adapter {
         return {
           ok: false,
           detail:
-            '未导入 WorkBuddy 登录态。用 tools/wb-oauth-export.mjs 从客户端导出，再跑 `wb login`。' +
-            (existsSync(clientAuthFile()) ? '' : `（也未找到客户端登录态文件：${clientAuthFile()}）`),
+            '未登录 —— 跑 `wb login`（浏览器授权一次，走官方 OAuth 通道，无需读客户端文件）。',
         };
       }
       return { ok: true, detail: credentialSummary(), source: credentialPath() };
     },
 
     /**
-     * 「登录」= 导入客户端登录态。
-     *
-     * 与 mmcode/qoder 的差别：WorkBuddy 的客户端登录态是**加密信封**（AES-GCM，密钥绑定机器），
-     * 解密必须借客户端运行时 —— 本工具不重复实现那段解密，改为引导用户跑 `tools/wb-oauth-export.mjs`。
-     * 该脚本产出明文 JSON，导入后由本工具长期维护（自动刷新 + 轮换写回）。
+     * 「登录」= 官方 OAuth 设备授权第 ① 步：打印授权 URL。
+     * 浏览器完成登录后，用 `wb login-poll` 取 token（第 ② 步）。
+     * 走官方给插件/CLI 的正规通道 —— **不读本机登录态、不解密**。
      */
     async login(): Promise<void> {
-      const fromEnv = (process.env.WB_CREDENTIAL_FILE ?? '').trim();
-      if (fromEnv) {
-        const payload = JSON.parse(readFileSync(fromEnv, 'utf8')) as Record<string, unknown>;
-        importCredentialFrom(payload);
-        process.stdout.write(`已从 ${fromEnv} 导入登录态 → ${credentialPath()}\n${credentialSummary()}\n`);
-        return;
-      }
-      process.stdout.write(
-        'WorkBuddy 的客户端登录态是加密的，需要先导出为明文：\n' +
-          '\n' +
-          '  1) 确保 WorkBuddy 桌面端已登录\n' +
-          '  2) 跑：node tools/wb-oauth-export.mjs        （借客户端运行时解密）\n' +
-          '  3) 导入：wb import wb-oauth.json  （或 WB_CREDENTIAL_FILE=<文件> wb login）\n' +
-          '\n' +
-          '导出文件等同账号登录态 —— 不提交版本库、导入后请删除本地副本。\n',
+      const out = process.stdout;
+      const authUrl = await startLogin();
+      out.write(
+        '请在浏览器打开下面的链接完成登录（用你的 WorkBuddy 账号）：\n\n' +
+          '  ' + authUrl + '\n\n' +
+          '完成后回到终端执行：wb login-poll\n\n' +
+          '（登录态只保存在本机 ' + credentialPath() + '，权限 0600。）\n',
       );
     },
 

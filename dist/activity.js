@@ -16,7 +16,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { UpstreamError } from './errors.js';
-import { wbHeaders } from './credential.js';
+import { wbCommonHeaders } from './credential.js';
 const REQUEST_TIMEOUT_MS = 20_000;
 /** 端点路径（实测）。 */
 export const WB_SIGNIN_STATUS_PATH = '/v2/billing/meter/checkin-activity-status';
@@ -58,7 +58,7 @@ export class WbActivity {
         const method = init.method ?? 'POST';
         const res = await fetch(`${this.baseUrl}${path}`, {
             method,
-            headers: { ...wbHeaders(cred, token), accept: 'application/json, text/plain, */*' },
+            headers: { ...wbCommonHeaders(token), 'x-user-id': cred.uid },
             ...(method === 'POST' ? { body: JSON.stringify(init.body ?? {}) } : {}),
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });

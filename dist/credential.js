@@ -1,47 +1,42 @@
 /**
- * WorkBuddy 桌面端登录态（OAuth）—— 本项目唯一的凭证来源。
+ * WorkBuddy 凭证：**官方 OAuth 设备授权**（`wb login`）。
  *
- * ## 为什么用桌面端登录态，而不是 API 密钥（`ck_`）
- * 实测（2026-10）：**桌面端 OAuth accessToken 能直接用于聊天、模型清单、签到状态**，
- * 三条链路全部 HTTP 200 —— 既然登录态够用，就不必让用户去后台自签一个 `ck_` 密钥再粘过来。
- * 这与同家族的 waygate-qoder / waygate-mmcode 也一致：**都读本机客户端登录态**。
+ * ## 为什么走 OAuth，而不是读本机登录态
+ * WorkBuddy 桌面端的本机登录态（`%LOCALAPPDATA%\CodeBuddyExtension\...\*.info`）自某版本起
+ * 做了**字段级加密**（AES-256-GCM + 机器绑定密钥，密钥只在客户端运行时存在）。
+ * 早期社区反代项目（workbuddy2openai 等）面对的是明文，现在这条路已失效 ——
+ * 绕过它意味着对抗厂商主动设置的安全控制。
  *
- * ## 登录态从哪来（两种，按优先级）
- *   ① 本工具自己保存的 `~/.waygate/wb/oauth.json`（首次用 `wb login` 从客户端导入）
- *   ② 客户端原始文件：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`
+ * 而官方给插件/CLI 留了**正规登录通道**，走它就没有上述问题，且流程简单得多：
  *
- * 客户端文件里 `accessToken` / `refreshToken` 是**加密信封**（AES-256-GCM，密钥绑定机器）——
- * 解密需要借客户端运行时（见 `tools/wb-oauth-export.mjs`），故 `wb login` 会在需要时
- * 提示用户先跑导出工具；导出后的明文 JSON 本工具可长期维护（自动刷新 + 轮换写回）。
+ *   POST /v2/plugin/auth/state?platform=CLI          → { state, authUrl }
+ *   （浏览器打开 authUrl 完成登录）
+ *   GET  /v2/plugin/auth/token?state=<state>         → { accessToken, refreshToken, expiresIn, domain }
+ *   GET  /v2/plugin/login/account?state=<state>      → { uid, enterpriseId, nickname }
+ *
+ * 无 PKCE（state 由服务端签发）。本模块实现这个流程，并维护 token 生命周期。
  *
  * ## 令牌生命周期
- *   · access 实测约 **28 天**；提前 2 天自动刷新
- *   · refresh 时**两个 token 一起轮换**，必须写回（否则下次刷新用已作废的旧值）
- *   · 实测**不互踢**：刷新后旧 access 复打仍 200（官方插件刷新链，多会话共存）
+ *   · access 寿命由 `expiresIn` 给出；提前 2 天自动刷新
+ *   · refresh 走 `POST /v2/plugin/auth/token/refresh`（插件刷新链），两 token 一起轮换 → 必须写回
+ *   · 实测不互踢：刷新后旧 access 仍有效
  */
-import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { commandDir } from 'waygate-core';
 import { CredentialError, UpstreamError } from './errors.js';
-import { WORKBUDDY_ORIGIN, WORKBUDDY_CLI_VERSION, expandWorkBuddyUA } from './headers.js';
-/** 提前刷新余量：2 天（access 寿命实测约 28 天）。 */
+/** 提前刷新余量：2 天。 */
 export const WB_REFRESH_AHEAD_MS = 2 * 24 * 60 * 60 * 1000;
-const UA = expandWorkBuddyUA('WorkBuddy/5.8.0');
-/** 本工具保存的凭证位置。 */
+/** CN 域（国际版 base 为 https://www.workbuddy.ai，Origin 同域）。 */
+export const WB_BASE_URL = 'https://copilot.tencent.com';
+export const WB_ORIGIN = 'https://www.codebuddy.cn';
+/** 登录/刷新用的客户端标识（与官方 CLI 插件同形）。 */
+export const WB_CLIENT_UA = 'CLI/2.63.2 CodeBuddy/2.63.2';
+const REQUEST_TIMEOUT_MS = 30_000;
+/** 凭证落盘位置（`~/.waygate/wb/credential.json`）。 */
 export function credentialPath() {
     return join(commandDir('wb'), 'credential.json');
 }
-/** 客户端原始登录态文件（加密信封，仅供参考/提示用）。 */
-export function clientAuthFile() {
-    const override = (process.env.WB_CLIENT_AUTH_FILE ?? '').trim();
-    if (override)
-        return override;
-    const local = process.env.LOCALAPPDATA ?? join(process.env.USERPROFILE ?? homedir(), 'AppData', 'Local');
-    return join(local, 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info');
-}
-/** 取本工具已保存的凭证明文（无则 null）。 */
 export function readSavedCredential() {
     const p = credentialPath();
     if (!existsSync(p))
@@ -54,7 +49,7 @@ export function readSavedCredential() {
         return null;
     }
 }
-/** 落盘（0600）。refresh token 轮换后也要调用本函数写回。 */
+/** 落盘（0600）。token 轮换后也调用本函数写回。 */
 export function saveCredential(cred) {
     if (!cred.accessToken || !cred.refreshToken || !cred.uid) {
         throw new CredentialError('凭证需要 accessToken / refreshToken / uid 三个字段');
@@ -69,46 +64,143 @@ export function saveCredential(cred) {
     }
     return p;
 }
-/** 从导出工具的输出导入（`wb login <文件>` 或 `wb import-credential <文件>`）。 */
-export function importCredentialFrom(payload) {
-    const cred = {
-        accessToken: String(payload.accessToken ?? ''),
-        refreshToken: String(payload.refreshToken ?? ''),
-        uid: String(payload.uid ?? ''),
-        uin: payload.uin ? String(payload.uin) : undefined,
-        domain: payload.domain ? String(payload.domain) : undefined,
-        expiresAt: typeof payload.expiresAt === 'number' ? payload.expiresAt : undefined,
-    };
-    saveCredential(cred);
-    return cred;
-}
-/**
- * 按 uid 派生**稳定**设备头。
- *
- * 官方客户端用真实机器标识；本工具没有，但不能用随机值 —— 每次请求换一个机器 ID
- * 会像「同一账号在多台设备上来回跳」，反而触发风控。故按 uid 做确定性派生。
- */
-export function deriveStableId(uid, purpose) {
-    return createHash('sha256').update(`wb2a:${purpose}:${uid}`).digest('hex').slice(0, 36);
-}
-/** 出站请求头（登录态域）：官方桌面端公共头 + 稳定设备头 + Bearer。 */
-export function wbHeaders(cred, token) {
+/** 登录态域通用出站头（OAuth 流程与活动接口共用）。 */
+export function wbCommonHeaders(token) {
     return {
         'content-type': 'application/json',
-        accept: 'application/json',
+        accept: 'application/json, text/plain, */*',
         'x-requested-with': 'XMLHttpRequest',
-        origin: WORKBUDDY_ORIGIN,
-        referer: `${WORKBUDDY_ORIGIN}/`,
-        'user-agent': UA,
-        'x-codebuddy-request': '1',
-        'accept-language': 'zh-CN',
-        'x-machine-id': deriveStableId(cred.uid, 'machine'),
-        'x-session-id': deriveStableId(cred.uid, 'session'),
-        /* 领取族需要，值不校验但必须非空。 */
-        'x-user-id': cred.uid,
-        authorization: `Bearer ${token ?? cred.accessToken}`,
+        origin: WB_ORIGIN,
+        referer: `${WB_ORIGIN}/`,
+        'user-agent': WB_CLIENT_UA,
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
     };
 }
+async function postJson(url, body, token) {
+    let res;
+    try {
+        res = await fetch(url, {
+            method: 'POST',
+            headers: wbCommonHeaders(token),
+            body: JSON.stringify(body ?? {}),
+            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+    }
+    catch (err) {
+        throw new UpstreamError(`上游不可达（${url}）：${err.message}`);
+    }
+    const text = await res.text().catch(() => '');
+    let parsed;
+    try {
+        parsed = text ? JSON.parse(text) : {};
+    }
+    catch {
+        throw new UpstreamError(`${url} 返回非 JSON（HTTP ${res.status}）：${text.slice(0, 200)}`);
+    }
+    if (!res.ok) {
+        throw new UpstreamError(`${url} 失败（HTTP ${res.status}）：${String(parsed.msg ?? text).slice(0, 200)}`);
+    }
+    if (typeof parsed.code === 'number' && parsed.code !== 0) {
+        throw new UpstreamError(`${url} 失败（业务码 ${parsed.code}）：${String(parsed.msg ?? '')}`);
+    }
+    return (parsed.data ?? {});
+}
+async function getJson(url, token) {
+    let res;
+    try {
+        res = await fetch(url, { headers: wbCommonHeaders(token), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    }
+    catch (err) {
+        throw new UpstreamError(`上游不可达（${url}）：${err.message}`);
+    }
+    const text = await res.text().catch(() => '');
+    let parsed;
+    try {
+        parsed = text ? JSON.parse(text) : {};
+    }
+    catch {
+        throw new UpstreamError(`${url} 返回非 JSON（HTTP ${res.status}）：${text.slice(0, 200)}`);
+    }
+    if (!res.ok) {
+        const detail = String(parsed.msg ?? '').trim();
+        throw new UpstreamError(`${url} 失败（HTTP ${res.status}）${detail ? `：${detail}` : ''}`);
+    }
+    if (typeof parsed.code === 'number' && parsed.code !== 0) {
+        /* 「登录未完成」是 pending 的正常表达，调用方需要区分它。 */
+        throw new PendingLoginError(`${url} 业务码 ${parsed.code}：${String(parsed.msg ?? '')}`);
+    }
+    return (parsed.data ?? {});
+}
+/** 登录尚未完成（poll 时的正常待机状态，不是错误）。 */
+export class PendingLoginError extends Error {
+    name = 'PendingLoginError';
+    constructor(message) {
+        super(message);
+    }
+}
+/* ─────────────────────── OAuth 设备授权流程 ─────────────────────── */
+/** 第 ① 步：拿授权 URL（用户在浏览器打开完成登录）。 */
+export async function startLogin(baseUrl = WB_BASE_URL) {
+    const data = await postJson(`${baseUrl}/v2/plugin/auth/state?platform=CLI`, {});
+    if (typeof data.state !== 'string' || !data.state || typeof data.authUrl !== 'string' || !data.authUrl) {
+        throw new UpstreamError('登录接口未返回 state / authUrl');
+    }
+    /* state 是后续取 token 的凭据，落盘 0600（登录完成后删除）。 */
+    const p = join(commandDir('wb'), 'login-state.json');
+    writeFileSync(p, JSON.stringify({ state: data.state, baseUrl }, null, 2) + '\n', { mode: 0o600 });
+    return data.authUrl;
+}
+/** 第 ②③ 步：轮询取 token + 账号信息。未完成时抛 `PendingLoginError`。 */
+export async function pollLogin(baseUrl = WB_BASE_URL) {
+    const statePath = join(commandDir('wb'), 'login-state.json');
+    if (!existsSync(statePath)) {
+        throw new CredentialError('没有待完成的登录 —— 先跑 `wb login`');
+    }
+    const saved = JSON.parse(readFileSync(statePath, 'utf8'));
+    const state = typeof saved.state === 'string' ? saved.state : '';
+    if (!state)
+        throw new CredentialError('登录 state 文件损坏 —— 重新跑 `wb login`');
+    const base = typeof saved.baseUrl === 'string' && saved.baseUrl ? saved.baseUrl : baseUrl;
+    const tok = await getJson(`${base}/v2/plugin/auth/token?state=${encodeURIComponent(state)}`);
+    if (typeof tok.accessToken !== 'string' || !tok.accessToken) {
+        throw new CredentialError('token 端点未返回 accessToken');
+    }
+    /* 账号信息是锦上添花：拿不到也不该让整次登录失败（uid 可从别处补）。 */
+    let uid = '';
+    let enterpriseId;
+    let nickname;
+    try {
+        const acct = await getJson(`${base}/v2/plugin/login/account?state=${encodeURIComponent(state)}`, tok.accessToken);
+        uid = typeof acct.uid === 'string' ? acct.uid : '';
+        enterpriseId = typeof acct.enterpriseId === 'string' ? acct.enterpriseId : undefined;
+        nickname = typeof acct.nickname === 'string' ? acct.nickname : undefined;
+    }
+    catch {
+        /* 忽略：下面若 uid 仍空则报错 */
+    }
+    if (!uid)
+        throw new CredentialError('未能取到账号 uid —— 请重试登录');
+    const cred = {
+        accessToken: tok.accessToken,
+        refreshToken: typeof tok.refreshToken === 'string' ? tok.refreshToken : '',
+        uid,
+        enterpriseId,
+        nickname,
+        domain: typeof tok.domain === 'string' ? tok.domain : undefined,
+        expiresAt: typeof tok.expiresIn === 'number' && tok.expiresIn > 0 ? Date.now() + tok.expiresIn * 1000 : undefined,
+    };
+    saveCredential(cred);
+    try {
+        writeFileSync(statePath, '', { mode: 0o600 });
+        const { unlinkSync } = await import('node:fs');
+        unlinkSync(statePath);
+    }
+    catch {
+        /* state 清理失败不影响登录结果 */
+    }
+    return cred;
+}
+/* ─────────────────────── token 生命周期 ─────────────────────── */
 /**
  * token 管理器：缓存 access token，临期自动刷新（并发去重），轮换时写回。
  */
@@ -117,15 +209,14 @@ export class WbTokenManager {
     onLog;
     cached = null;
     inFlight = null;
-    constructor(baseUrl, onLog = () => { }) {
+    constructor(baseUrl = WB_BASE_URL, onLog = () => { }) {
         this.baseUrl = baseUrl;
         this.onLog = onLog;
     }
-    /** 取可用 access token（必要时刷新并写回）。 */
     async accessToken() {
         const cred = this.cached ?? readSavedCredential();
         if (!cred) {
-            throw new CredentialError('未导入 WorkBuddy 登录态 —— 先跑 `wb login`（用 tools/wb-oauth-export.mjs 从客户端导出后导入）');
+            throw new CredentialError('未登录 —— 先跑 `wb login`（浏览器授权一次）');
         }
         this.cached = cred;
         if (cred.expiresAt && Date.now() + WB_REFRESH_AHEAD_MS < cred.expiresAt)
@@ -142,13 +233,12 @@ export class WbTokenManager {
     async forceRefresh() {
         const cred = this.cached ?? readSavedCredential();
         if (!cred)
-            throw new CredentialError('未导入 WorkBuddy 登录态。');
+            throw new CredentialError('未登录。');
         return this.refresh(cred);
     }
     async refresh(cred) {
-        const headers = wbHeaders(cred);
-        delete headers['authorization'];
-        delete headers['x-user-id'];
+        const headers = wbCommonHeaders();
+        delete headers['content-type'];
         headers['x-refresh-token'] = cred.refreshToken;
         headers['x-auth-refresh-source'] = 'plugin';
         let res;
@@ -157,7 +247,7 @@ export class WbTokenManager {
                 method: 'POST',
                 headers,
                 body: '{}',
-                signal: AbortSignal.timeout(20_000),
+                signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
             });
         }
         catch (err) {
@@ -195,13 +285,12 @@ export class WbTokenManager {
         return next.accessToken;
     }
 }
-/** 供 doctor / 启动输出展示的凭证摘要（**绝不回显令牌**）。 */
+/** 供 doctor / 启动输出展示的摘要（**绝不回显令牌**）。 */
 export function credentialSummary() {
     const cred = readSavedCredential();
     if (!cred)
-        return '未导入';
+        return '未登录';
     const left = cred.expiresAt ? Math.round((cred.expiresAt - Date.now()) / 3600_000) : null;
-    const uid = cred.uid.slice(0, 8);
-    return left !== null ? `已登录（uid ${uid}…，登录态约剩 ${left} 小时）` : `已登录（uid ${uid}…，到期未知）`;
+    const who = cred.nickname ? `${cred.nickname}` : `uid ${cred.uid.slice(0, 8)}…`;
+    return left !== null ? `已登录：${who}（登录态约剩 ${left} 小时）` : `已登录：${who}（到期未知）`;
 }
-export { WORKBUDDY_CLI_VERSION, expandWorkBuddyUA };
