@@ -17,6 +17,7 @@ import { UpstreamError } from './errors.js';
 import { buildUpstreamHeaders } from './headers.js';
 import { rewriteRequestBody, type PromptRewriteMode } from './rewrite.js';
 import {
+  LOGIN_WAIT_MS,
   PendingLoginError,
   WbTokenManager,
   credentialPath,
@@ -28,6 +29,19 @@ import {
   type WbCredential,
 } from './credential.js';
 import { WbActivity, renderRunAll, renderSigninPanel } from './activity.js';
+
+/**
+ * 轮询进度行 —— 用 `\r` 覆盖同一行，不刷屏。
+ *
+ * 没有它，用户面对的是最长 2 分钟的**完全静默**，分不清"在等"还是"卡死了"。
+ */
+function tickTo(out: NodeJS.WriteStream): (info: { waitedMs: number; remainingMs: number }) => void {
+  return ({ waitedMs, remainingMs }) => {
+    const w = Math.round(waitedMs / 1000);
+    const r = Math.round(remainingMs / 1000);
+    out.write(`\r  ⏳ 等待登录完成… ${w}s（最多再等 ${r}s，按 Ctrl+C 可中断）   `);
+  };
+}
 
 export const DEFAULT_WB_BASE_URL = 'https://copilot.tencent.com';
 export const DEFAULT_WB_CHAT_PATH = '/v2/chat/completions';
@@ -90,15 +104,15 @@ export function createWorkBuddyAdapter(opts: WbAdapterOptions = {}): Adapter {
     extraCommands: [
       {
         name: 'login-poll',
-        summary: '完成登录：轮询取 token（浏览器授权后执行）',
+        summary: `完成登录：轮询取 token（浏览器授权后执行；\`login\` 等待超时也用它）`,
         usage: 'login-poll',
         async run() {
           try {
-            const cred = await pollLogin();
-            return '登录成功 → ' + credentialPath() + '\n' + credentialSummary();
+            const cred = await pollLogin(LOGIN_WAIT_MS, tickTo(process.stdout));
+            return '登录成功 → ' + credentialPath() + '\n' + credentialSummary() + '\n（授权账号 ' + cred.uid.slice(0, 8) + '…）';
           } catch (err) {
             if (err instanceof PendingLoginError) {
-              return '⏳ 尚未完成授权 —— 请先在浏览器里完成登录，然后重跑：wb login-poll';
+              return '⏳ 还没看到你的登录完成 —— 请先在浏览器里打开链接完成登录，然后重跑：wb login-poll';
             }
             throw err;
           }
@@ -137,8 +151,10 @@ export function createWorkBuddyAdapter(opts: WbAdapterOptions = {}): Adapter {
     },
 
     /**
-     * 「登录」= 官方 OAuth 设备授权第 ① 步：打印授权 URL。
-     * 浏览器完成登录后，用 `wb login-poll` 取 token（第 ② 步）。
+     * 「登录」= 官方 OAuth 设备授权：打印授权 URL 后**原地等 2 分钟**（用户口径）。
+     *
+     * 用户在浏览器点完登录，终端**自动继续**，无需手动回来再跑一次 `login-poll`。
+     * 超时 → 抛 `PendingLoginError`，**state 保留**，提示改用 `wb login-poll` 续取。
      * 走官方给插件/CLI 的正规通道 —— **不读本机登录态、不解密**。
      */
     async login(): Promise<void> {
@@ -147,9 +163,23 @@ export function createWorkBuddyAdapter(opts: WbAdapterOptions = {}): Adapter {
       out.write(
         '请在浏览器打开下面的链接完成登录（用你的 WorkBuddy 账号）：\n\n' +
           '  ' + authUrl + '\n\n' +
-          '完成后回到终端执行：wb login-poll\n\n' +
+          `完成后本终端会**自动继续**（最多等 ${Math.round(LOGIN_WAIT_MS / 1000)} 秒）。\n\n` +
           '（登录态只保存在本机 ' + credentialPath() + '，权限 0600。）\n',
       );
+      try {
+        const cred = await pollLogin(LOGIN_WAIT_MS, tickTo(out));
+        void cred;
+        out.write('\n✓ 登录成功 → ' + credentialPath() + '\n' + credentialSummary() + '\n');
+      } catch (err) {
+        if (err instanceof PendingLoginError) {
+          out.write(
+            `\n⏳ 等了 ${Math.round(LOGIN_WAIT_MS / 1000)} 秒还没看到登录完成。\n` +
+              '   完成浏览器登录后，回来执行：wb login-poll\n',
+          );
+          throw err;
+        }
+        throw err;
+      }
     },
 
     /** 模型清单：真拉上游；失败回落内置（并如实标注）。 */

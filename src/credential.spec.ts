@@ -135,14 +135,55 @@ describe('OAuth 设备授权：第 ① 步拿授权 URL', () => {
 });
 
 describe('OAuth 设备授权：第 ②③ 步取 token', () => {
-  it('★ 未完成授权时抛 PendingLoginError（不是硬错误）', async () => {
+  /*
+   * ⚠️ 从 v0.1.3 起 `pollLogin(timeoutMs)` **默认原地等 2 分钟**（`wb login` 阻塞等待）。
+   * 所以测试里一律传一个很短的超时 —— 不传会真的等满 2 分钟（vitest 5s 超时失败）。
+   */
+  it('★ 未完成授权 → 等到超时后抛 PendingLoginError（不是硬错误），且 state 保留供 login-poll 续取', async () => {
     vi.stubGlobal('fetch', vi.fn(async (u: string) => {
       if (String(u).includes('/auth/state')) return json({ code: 0, data: { state: 'st-1', authUrl: 'https://x/login' } });
       /* 业务码非 0 = 「login ing」 */
       return json({ code: 40001, msg: 'login ing' });
     }));
     await startLogin();
-    await expect(pollLogin()).rejects.toBeInstanceOf(PendingLoginError);
+    await expect(pollLogin(60, undefined, 1)).rejects.toBeInstanceOf(PendingLoginError);
+    /* ★ state 必须还在：用户随后授权完还能跑 `wb login-poll` 救回来。 */
+    expect(existsSync(join(dir, 'wb', 'login-state.json'))).toBe(true);
+  });
+
+  it('★ 原地轮询：先 pending 数轮、后成功（`login` 阻塞等待的核心路径）', async () => {
+    let polls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => {
+      const url = String(u);
+      if (url.includes('/auth/state')) return json({ code: 0, data: { state: 'st-p', authUrl: 'https://x/login' } });
+      if (url.includes('/auth/token')) {
+        polls += 1;
+        /* 前两次未授权，第三次成功 —— 证明它**会重试**而不是一次失败就退出。 */
+        if (polls < 3) return json({ code: 40001, msg: 'login ing' });
+        return json({ code: 0, data: { accessToken: 'at_ok', refreshToken: 'rt_ok', expiresIn: 2419200 } });
+      }
+      if (url.includes('/login/account')) return json({ code: 0, data: { uid: 'u-p' } });
+      return json({ code: 0, data: {} });
+    }));
+    await startLogin();
+    /* interval 传 1ms：测试不必真等 3s×2。 */
+    const cred = await pollLogin(10_000, undefined, 1);
+    expect(cred.accessToken).toBe('at_ok');
+    expect(polls).toBe(3);
+  });
+
+  it('★ 轮询期间报进度（否则终端最长 2 分钟完全静默）', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => {
+      if (String(u).includes('/auth/state')) return json({ code: 0, data: { state: 'st-t', authUrl: 'https://x/login' } });
+      return json({ code: 40001, msg: 'login ing' });
+    }));
+    await startLogin();
+    const ticks: number[] = [];
+    /* 60ms 窗口 + 1ms 间隔 → 必然 tick 若干次，好断言「进度确实在报」。 */
+    await expect(pollLogin(60, (i) => ticks.push(i.waitedMs), 1)).rejects.toBeInstanceOf(PendingLoginError);
+    expect(ticks.length).toBeGreaterThan(0);
+    /* 剩余时间要递减（进度条语义），不能恒定。 */
+    expect(ticks[ticks.length - 1]).toBeGreaterThanOrEqual(ticks[0]!);
   });
 
   it('成功后落盘完整凭证（含账号信息）', async () => {

@@ -23,6 +23,11 @@
  */
 /** 提前刷新余量：2 天。 */
 export declare const WB_REFRESH_AHEAD_MS: number;
+/**
+ * `login` 原地等待授权的时长（用户口径 2 分钟）；超时后保留 state，
+ * 提示用户改用 `wb login-poll` 续取。
+ */
+export declare const LOGIN_WAIT_MS = 120000;
 /** CN 域（国际版 base 为 https://www.workbuddy.ai，Origin 同域）。 */
 export declare const WB_BASE_URL = "https://copilot.tencent.com";
 export declare const WB_ORIGIN = "https://www.codebuddy.cn";
@@ -61,8 +66,23 @@ export declare class PendingLoginError extends Error {
 }
 /** 第 ① 步：拿授权 URL（用户在浏览器打开完成登录）。 */
 export declare function startLogin(baseUrl?: string): Promise<string>;
-/** 第 ②③ 步：轮询取 token + 账号信息。未完成时抛 `PendingLoginError`。 */
-export declare function pollLogin(baseUrl?: string): Promise<WbCredential>;
+/**
+ * 第 ②③ 步：取 token + 账号信息（授权完成后调用）。
+ *
+ * **原地轮询**：WorkBuddy 未完成授权时返回**业务码非 0**（不是 HTTP 错误），
+ * `getJson` 把它包成 `PendingLoginError` —— 这里捕获它并继续等，直到：
+ *   · 拿到 token（返回凭证）；或
+ *   · 等满 `timeoutMs`（抛 `PendingLoginError`，**state 保留**，用户可跑 `login-poll` 续取）；或
+ *   · 遇到真错误（state 损坏 / 非 pending 的失败）→ 直接抛。
+ *
+ * `onTick` 每轮失败调一次：让终端能显示「等待中…」，否则用户面对的是最长 2 分钟的
+ * **完全静默**，分不清是在等、还是已经卡死。
+ * `intervalMs` 仅测试需要（默认 3s）；生产走默认值。
+ */
+export declare function pollLogin(timeoutMs?: number, onTick?: (info: {
+    waitedMs: number;
+    remainingMs: number;
+}) => void, intervalMs?: number): Promise<WbCredential>;
 /**
  * token 管理器：缓存 access token，临期自动刷新（并发去重），轮换时写回。
  */

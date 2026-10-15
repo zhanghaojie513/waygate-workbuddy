@@ -31,6 +31,15 @@ import { CredentialError, UpstreamError } from './errors.js';
 /** 提前刷新余量：2 天。 */
 export const WB_REFRESH_AHEAD_MS = 2 * 24 * 60 * 60 * 1000;
 
+/**
+ * `login` 原地等待授权的时长（用户口径 2 分钟）；超时后保留 state，
+ * 提示用户改用 `wb login-poll` 续取。
+ */
+export const LOGIN_WAIT_MS = 120_000;
+
+/** 轮询间隔（WorkBuddy 的 state 端点未给建议间隔，取 3s —— 与 MiniMax 设备授权同节奏）。 */
+const LOGIN_POLL_INTERVAL_MS = 3000;
+
 /** CN 域（国际版 base 为 https://www.workbuddy.ai，Origin 同域）。 */
 export const WB_BASE_URL = 'https://copilot.tencent.com';
 export const WB_ORIGIN = 'https://www.codebuddy.cn';
@@ -195,8 +204,24 @@ export async function startLogin(baseUrl = WB_BASE_URL): Promise<string> {
   return data.authUrl;
 }
 
-/** 第 ②③ 步：轮询取 token + 账号信息。未完成时抛 `PendingLoginError`。 */
-export async function pollLogin(baseUrl = WB_BASE_URL): Promise<WbCredential> {
+/**
+ * 第 ②③ 步：取 token + 账号信息（授权完成后调用）。
+ *
+ * **原地轮询**：WorkBuddy 未完成授权时返回**业务码非 0**（不是 HTTP 错误），
+ * `getJson` 把它包成 `PendingLoginError` —— 这里捕获它并继续等，直到：
+ *   · 拿到 token（返回凭证）；或
+ *   · 等满 `timeoutMs`（抛 `PendingLoginError`，**state 保留**，用户可跑 `login-poll` 续取）；或
+ *   · 遇到真错误（state 损坏 / 非 pending 的失败）→ 直接抛。
+ *
+ * `onTick` 每轮失败调一次：让终端能显示「等待中…」，否则用户面对的是最长 2 分钟的
+ * **完全静默**，分不清是在等、还是已经卡死。
+ * `intervalMs` 仅测试需要（默认 3s）；生产走默认值。
+ */
+export async function pollLogin(
+  timeoutMs = LOGIN_WAIT_MS,
+  onTick?: (info: { waitedMs: number; remainingMs: number }) => void,
+  intervalMs = LOGIN_POLL_INTERVAL_MS,
+): Promise<WbCredential> {
   const statePath = join(commandDir('wb'), 'login-state.json');
   if (!existsSync(statePath)) {
     throw new CredentialError('没有待完成的登录 —— 先跑 `wb login`');
@@ -204,8 +229,26 @@ export async function pollLogin(baseUrl = WB_BASE_URL): Promise<WbCredential> {
   const saved = JSON.parse(readFileSync(statePath, 'utf8')) as { state?: unknown; baseUrl?: unknown };
   const state = typeof saved.state === 'string' ? saved.state : '';
   if (!state) throw new CredentialError('登录 state 文件损坏 —— 重新跑 `wb login`');
-  const base = typeof saved.baseUrl === 'string' && saved.baseUrl ? saved.baseUrl : baseUrl;
+  const base = typeof saved.baseUrl === 'string' && saved.baseUrl ? saved.baseUrl : WB_BASE_URL;
 
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+
+  for (;;) {
+    try {
+      return await fetchCredential(base, state, statePath);
+    } catch (err) {
+      /* 「登录未完成」是正常待机态，不是失败 —— 继续等。 */
+      if (!(err instanceof PendingLoginError)) throw err;
+      if (Date.now() >= deadline) throw err;
+      onTick?.({ waitedMs: Date.now() - startedAt, remainingMs: Math.max(0, deadline - Date.now()) });
+      await new Promise((r) => setTimeout(r, Math.min(intervalMs, Math.max(0, deadline - Date.now()))));
+    }
+  }
+}
+
+/** 打一次 token + account 端点并落盘（`PendingLoginError` 由调用方判为待机态）。 */
+async function fetchCredential(base: string, state: string, statePath: string): Promise<WbCredential> {
   const tok = await getJson<{ accessToken?: unknown; refreshToken?: unknown; expiresIn?: unknown; domain?: unknown }>(
     `${base}/v2/plugin/auth/token?state=${encodeURIComponent(state)}`,
   );
@@ -240,7 +283,6 @@ export async function pollLogin(baseUrl = WB_BASE_URL): Promise<WbCredential> {
   };
   saveCredential(cred);
   try {
-    writeFileSync(statePath, '', { mode: 0o600 });
     const { unlinkSync } = await import('node:fs');
     unlinkSync(statePath);
   } catch {

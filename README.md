@@ -24,14 +24,26 @@
 # 全局安装（之后命令就是 wb）
 npm i -g waygate-workbuddy
 
-# ① 登录：打印授权链接（浏览器打开、用你的 WorkBuddy 账号完成登录）
+# 登录：打印授权链接（浏览器打开、用你的 WorkBuddy 账号完成登录）
 wb login
 
-# ② 完成登录：回来取 token
-wb login-poll
-
-# ③ 启动
+# 启动
 wb
+```
+
+`wb login` 会**原地等你 2 分钟** —— 你在浏览器点完登录，终端**自动继续**，无需再来一次。
+若超过 2 分钟，它会提示你用 `wb login-poll` 续取：
+
+```
+请在浏览器打开下面的链接完成登录（用你的 WorkBuddy 账号）：
+
+  https://copilot.tencent.com/...?state=...
+
+完成后本终端会**自动继续**（最多等 120 秒）。
+
+  ⏳ 等待登录完成… 3s（最多再等 117s，按 Ctrl+C 可中断）
+
+✓ 登录成功 → ~/.waygate/wb/credential.json
 ```
 
 启动后终端会打印**模型 ID 与代理地址**，把它们填进你的客户端即可。
@@ -45,8 +57,8 @@ wb
 ```bash
 wb                       # 启动反代（同 wb serve），打印模型 ID 与代理地址
 wb models                # 只列出模型 ID（不起服务）
-wb login                 # 登录第 ① 步：打印授权链接
-wb login-poll            # 登录第 ② 步：浏览器授权后取 token
+wb login                 # 登录：打印授权链接并原地等 2 分钟（超时提示改用 login-poll）
+wb login-poll            # 完成登录：浏览器授权后取 token（`login` 等待超时也用它）
 wb checkin               # 签到代领 + 跑成长任务 + 连登兑换
 wb status                # 只查签到状态（不领取）
 wb doctor                # 自检：端口 / 登录态 / 模型清单 / 上游连通 / 令牌刷新
@@ -117,7 +129,7 @@ A：WorkBuddy **官方给插件/CLI 的 OAuth 设备授权**。
 
 **Q：登录态过期了怎么办？**
 A：access 约 28 天，本工具**提前 2 天自动刷新**并写回，通常无需人工干预。
-若 refresh 也失效（如在其他设备登出），重跑 `wb login` + `wb login-poll` 即可。`wb doctor` 会显示剩余时长。
+若 refresh 也失效（如在其他设备登出），重跑 `wb login`（等 2 分钟；超时用 `wb login-poll` 续取）即可。`wb doctor` 会显示剩余时长。
 
 **Q：`checkin` 报「未完成」的任务？**
 A：那是任务的前置条件没满足（多为「体验 XX」型）。工具**如实记 `skipped`，不伪造行为去凑**。
