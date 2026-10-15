@@ -1,0 +1,55 @@
+{
+  "name": "waygate-workbuddy",
+  "version": "0.1.0",
+  "description": "WorkBuddy 本地反代：按官方桌面端指纹出站，提供 OpenAI/Anthropic 兼容的本地聊天端点",
+  "keywords": [
+    "workbuddy",
+    "workbuddy2api",
+    "reverse-proxy",
+    "openai-compatible",
+    "anthropic",
+    "claude-code",
+    "cursor",
+    "checkin",
+    "credits"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhanghaojie513/waygate-workbuddy.git"
+  },
+  "homepage": "https://github.com/zhanghaojie513/waygate-workbuddy#readme",
+  "bugs": {
+    "url": "https://github.com/zhanghaojie513/waygate-workbuddy/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "wb": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "dev": "node --experimental-strip-types src/index.ts"
+  },
+  "dependencies": {
+    "waygate-core": "^0.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.9"
+  }
+}

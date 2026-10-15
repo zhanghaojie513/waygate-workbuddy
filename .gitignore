@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.DS_Store
+
+# 运行期凭证与导出物（等同账号登录态，绝不入库）
+wb-oauth.json
+.e2e-*
