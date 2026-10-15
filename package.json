@@ -27,7 +27,7 @@
     "node": ">=20"
   },
   "bin": {
-    "wb": "./dist/index.js"
+    "wb": "dist/index.js"
   },
   "main": "./dist/index.js",
   "files": [
