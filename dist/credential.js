@@ -21,6 +21,7 @@
  *   · refresh 走 `POST /v2/plugin/auth/token/refresh`（插件刷新链），两 token 一起轮换 → 必须写回
  *   · 实测不互踢：刷新后旧 access 仍有效
  */
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { commandDir } from 'waygate-core';
@@ -64,8 +65,14 @@ export function saveCredential(cred) {
     }
     return p;
 }
-/** 登录态域通用出站头（OAuth 流程与活动接口共用）。 */
-export function wbCommonHeaders(token) {
+/**
+ * 登录态域通用出站头（OAuth 流程与活动接口共用）。
+ *
+ * ⚠️ 这些头不是可有可无的装饰 —— `x-codebuddy-request` 是**风控闸门头**
+ * （实测：缺它时签到/领取类端点被拒），`x-machine-id`/`x-session-id` 是设备标识
+ * （官方客户端有，缺失可能被当作异常来源）。三者缺一不可。
+ */
+export function wbCommonHeaders(token, uid) {
     return {
         'content-type': 'application/json',
         accept: 'application/json, text/plain, */*',
@@ -73,8 +80,22 @@ export function wbCommonHeaders(token) {
         origin: WB_ORIGIN,
         referer: `${WB_ORIGIN}/`,
         'user-agent': WB_CLIENT_UA,
+        'x-codebuddy-request': '1',
+        'accept-language': 'zh-CN',
+        /* 设备头：官方客户端用真实机器标识；我们没有，按 uid 做**确定性派生**
+           （不能用随机值——每次请求换一个机器 ID 像「同账号在多台设备间跳」，反而触发风控）。 */
+        ...(uid
+            ? {
+                'x-machine-id': deriveStableId(uid, 'machine'),
+                'x-session-id': deriveStableId(uid, 'session'),
+            }
+            : {}),
         ...(token ? { authorization: `Bearer ${token}` } : {}),
     };
+}
+/** 按 uid 派生稳定设备标识（OAuth 登录态没有真实机器 ID，用确定性派生代替随机）。 */
+export function deriveStableId(uid, purpose) {
+    return createHash('sha256').update(`wb:${purpose}:${uid}`).digest('hex').slice(0, 36);
 }
 async function postJson(url, body, token) {
     let res;

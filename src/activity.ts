@@ -100,7 +100,7 @@ export class WbActivity {
     const method = init.method ?? 'POST';
     const res = await fetch(`${this.baseUrl}${path}`, {
       method,
-      headers: { ...wbCommonHeaders(token), 'x-user-id': cred.uid },
+      headers: { ...wbCommonHeaders(token, cred.uid), 'x-user-id': cred.uid },
       ...(method === 'POST' ? { body: JSON.stringify(init.body ?? {}) } : {}),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -173,8 +173,17 @@ export class WbActivity {
   }
 
   /**
-   * 跑一轮任务：未接的先 accept，可领的 claim。
-   * 前置条件不满足 → `skipped`（**如实记录，不伪造行为**）。
+  /**
+   * 跑一轮任务：**对全部未锁定任务先 accept、再逐个 claim**，由上游语义分流结果。
+   *
+   * ⚠️ 为什么不「先筛出可领的再 claim」：实测（2026-10）任务响应里**没有**
+   * `claim_status` / `status` 这类「可领」字段 —— 只有 `accept_status`
+   * （取值 `accepted` / `claimed` / `in_progress`）与 `progress{current,target}`。
+   * 靠臆想的字段筛会**一个都筛不出来**（这正是上一版的 bug）。
+   * 正确做法：对每个任务都试 claim，让上游回答：
+   *   · 已领过 → 200 + `already_claimed:true`   → `already`
+   *   · 未完成 → 400 + `task not completed`     → `skipped`（等真实使用后再领）
+   *   · 成功   → 200 + `credit` / `energy`      → `claimed`
    */
   async runTasks(): Promise<GrowthTaskOutcome[]> {
     let tasks: Array<Record<string, unknown>>;
@@ -184,52 +193,48 @@ export class WbActivity {
       return [{ code: '-', title: null, outcome: 'error', reason: (err as Error).message }];
     }
 
-    const out: GrowthTaskOutcome[] = [];
-    const toAccept = tasks
-      .filter((t) => typeof t.task_code === 'string' && t.accept_status === 'not_accepted')
-      .map((t) => t.task_code as string);
-    if (toAccept.length > 0) {
+    const titles = new Map<string, string | null>();
+    const acceptable = tasks.filter((t) => typeof t.task_code === 'string' && t.locked !== true);
+    for (const t of acceptable) titles.set(String(t.task_code), str(t.title));
+
+    /* 先批量接单（复数数组一次打包）；整体失败也继续逐个 claim —— 有些任务此前已接过。 */
+    if (acceptable.length > 0) {
       try {
-        await this.call(WB_GROWTH_TASKS_ACCEPT_PATH, { body: { task_codes: toAccept } });
-        for (const code of toAccept) {
-          const t = tasks.find((x) => x.task_code === code);
-          out.push({ code, title: str(t?.title), outcome: 'accepted' });
-        }
-      } catch (err) {
-        for (const code of toAccept) {
-          const t = tasks.find((x) => x.task_code === code);
-          out.push({ code, title: str(t?.title), outcome: 'error', reason: (err as Error).message });
-        }
+        await this.call(WB_GROWTH_TASKS_ACCEPT_PATH, { body: { task_codes: acceptable.map((t) => t.task_code) } });
+      } catch {
+        /* 忽略：下面逐个 claim 仍可能成功 */
       }
     }
 
-    /* 只对「可领」的发 claim（accept 过但没完成的会 400，属正常业务语义）。 */
-    for (const t of tasks) {
-      const code = typeof t.task_code === 'string' ? t.task_code : null;
-      if (!code) continue;
-      const claimable = t.claim_status === 'claimable' || t.status === 'claimable';
-      if (!claimable) continue;
+    const out: GrowthTaskOutcome[] = [];
+    for (const t of acceptable) {
+      const code = String(t.task_code);
       try {
         const d = await this.call<Record<string, unknown>>(
           `/v2/activity/growth/tasks/${encodeURIComponent(code)}/claim`,
           { body: {} },
         );
         if (d.already_claimed === true) {
-          out.push({ code, title: str(t.title), outcome: 'already' });
-        } else {
-          const credit = num(d.credit) ?? num(d.credit_granted);
-          out.push({
-            code,
-            title: str(t.title),
-            outcome: 'claimed',
-            reason: credit !== null ? `+${credit} 积分` : undefined,
-          });
+          out.push({ code, title: titles.get(code) ?? null, outcome: 'already', reason: '此前已领过' });
+          continue;
         }
+        const credit = num(d.credit) ?? num(d.credit_granted);
+        const energy = num(d.energy);
+        const rewards = [
+          credit !== null && credit > 0 ? `+${credit} 积分` : null,
+          energy !== null && energy > 0 ? `+${energy} 能量` : null,
+        ].filter(Boolean).join(' ');
+        out.push({ code, title: titles.get(code) ?? null, outcome: 'claimed', reason: rewards || '已领取' });
       } catch (err) {
         const msg = (err as Error).message;
-        /* 前置条件未满足是可预期的业务结果，不是错误 —— 如实记 skipped。 */
-        const skipped = /not completed|prerequisite|未完成|未达到/i.test(msg);
-        out.push({ code, title: str(t.title), outcome: skipped ? 'skipped' : 'error', reason: msg });
+        /* 任务未完成是可预期的业务结果（需在官方端真实使用后才能领），不是系统错误。 */
+        const notDone = /not completed|prerequisite|未完成|未达到/i.test(msg);
+        out.push({
+          code,
+          title: titles.get(code) ?? null,
+          outcome: notDone ? 'skipped' : 'error',
+          reason: notDone ? '任务未完成（需在官方端真实使用后才能领）' : msg,
+        });
       }
     }
     return out;

@@ -1,6 +1,6 @@
 {
   "name": "waygate-workbuddy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "WorkBuddy 本地反代：按官方桌面端指纹出站，提供 OpenAI/Anthropic 兼容的本地聊天端点",
   "keywords": [
     "workbuddy",

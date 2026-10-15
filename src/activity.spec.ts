@@ -106,7 +106,29 @@ describe('claimSignin', () => {
 });
 
 describe('runTasks', () => {
-  it('未接的先 accept（body 是复数 task_codes）', async () => {
+  /** 真实任务形状（2026-10 实测）：只有 accept_status + progress，没有 claim_status。 */
+  const REAL_TASKS = [
+    { task_code: 't1', title: '任务一', accept_status: 'accepted', progress: { current: 1, target: 1 } },
+    { task_code: 't2', title: '任务二', accept_status: 'claimed', progress: { current: 1, target: 1 } },
+  ];
+
+  it('★ 对全部未锁定任务都试 claim（不靠不存在的字段筛）', async () => {
+    const claimed: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => {
+      const url = String(u);
+      if (url.includes('/tasks/accept')) return json({ code: 0, data: {} });
+      if (url.includes('/claim')) {
+        claimed.push(url.split('/tasks/')[1]!.split('/')[0]!);
+        return json({ code: 0, data: { already_claimed: true } });
+      }
+      return json({ code: 0, data: { tasks: REAL_TASKS } });
+    }));
+    await makeActivity().runTasks();
+    /* 关键回归：两个任务**都**被 claim 过（旧实现在这里会一个都不发）。 */
+    expect(claimed.sort()).toEqual(['t1', 't2']);
+  });
+
+  it('未锁定的先批量 accept（body 是复数 task_codes）', async () => {
     let acceptBody: unknown;
     vi.stubGlobal('fetch', vi.fn(async (u: string, init?: RequestInit) => {
       const url = String(u);
@@ -114,29 +136,51 @@ describe('runTasks', () => {
         acceptBody = JSON.parse(String(init?.body ?? '{}'));
         return json({ code: 0, data: {} });
       }
-      return json({ code: 0, data: { tasks: [{ task_code: 't1', title: '任务一', accept_status: 'not_accepted' }] } });
+      if (url.includes('/claim')) return json({ code: 0, data: { already_claimed: true } });
+      return json({ code: 0, data: { tasks: [{ task_code: 't1', title: 'A', accept_status: 'accepted' }] } });
+    }));
+    await makeActivity().runTasks();
+    expect(acceptBody).toEqual({ task_codes: ['t1'] });
+  });
+
+  it('locked=true 的任务跳过（不 accept 也不 claim）', async () => {
+    let sawClaim = false;
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => {
+      if (String(u).includes('/claim')) { sawClaim = true; return json({ code: 0, data: {} }); }
+      return json({ code: 0, data: { tasks: [{ task_code: 't9', title: 'X', locked: true }] } });
     }));
     const out = await makeActivity().runTasks();
-    expect(acceptBody).toEqual({ task_codes: ['t1'] });
-    expect(out.some((t) => t.outcome === 'accepted')).toBe(true);
+    expect(sawClaim).toBe(false);
+    expect(out.length).toBe(0);
   });
 
   it('★ 任务未完成 → skipped（如实记录，不当错误、不伪造）', async () => {
     vi.stubGlobal('fetch', vi.fn(async (u: string) => {
       if (String(u).includes('/claim')) return json({ code: 400, msg: 'task not completed' }, 400);
-      return json({ code: 0, data: { tasks: [{ task_code: 't1', title: 'T', accept_status: 'accepted', claim_status: 'claimable' }] } });
+      return json({ code: 0, data: { tasks: [{ task_code: 't1', title: 'T', accept_status: 'accepted' }] } });
     }));
     const out = await makeActivity().runTasks();
     expect(out.find((x) => x.code === 't1')?.outcome).toBe('skipped');
   });
 
-  it('已领过 → already', async () => {
+  it('已领过 → already（上游 already_claimed）', async () => {
     vi.stubGlobal('fetch', vi.fn(async (u: string) => {
       if (String(u).includes('/claim')) return json({ code: 0, data: { already_claimed: true, credit: 0 } });
-      return json({ code: 0, data: { tasks: [{ task_code: 't1', title: 'T', claim_status: 'claimable' }] } });
+      return json({ code: 0, data: { tasks: [{ task_code: 't1', title: 'T', accept_status: 'claimed' }] } });
     }));
     const out = await makeActivity().runTasks();
     expect(out.find((x) => x.code === 't1')?.outcome).toBe('already');
+  });
+
+  it('真领到时回报积分/能量', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (u: string) => {
+      if (String(u).includes('/claim')) return json({ code: 0, data: { credit: 100, energy: 5 } });
+      return json({ code: 0, data: { tasks: [{ task_code: 't1', title: 'T', accept_status: 'accepted' }] } });
+    }));
+    const out = await makeActivity().runTasks();
+    const t = out.find((x) => x.code === 't1');
+    expect(t?.outcome).toBe('claimed');
+    expect(t?.reason).toContain('100');
   });
 });
 

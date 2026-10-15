@@ -89,6 +89,25 @@ describe('出站公共头（OAuth 域）', () => {
     expect(h['x-requested-with']).toBe('XMLHttpRequest');
   });
 
+
+  it('★ 风控闸门头必带（缺 x-codebuddy-request 会让签到/领取被拒）', () => {
+    const h = wbCommonHeaders('tok', 'uid-1');
+    expect(h['x-codebuddy-request']).toBe('1');
+    expect(h['accept-language']).toBe('zh-CN');
+  });
+
+  it('★ 设备头按 uid 稳定派生（不能用随机值）', () => {
+    const a = wbCommonHeaders('t', 'uid-1');
+    const b = wbCommonHeaders('t', 'uid-1');
+    expect(a['x-machine-id']).toBe(b['x-machine-id']);
+    expect(a['x-machine-id']).toHaveLength(36);
+    expect(a['x-machine-id']).not.toBe(a['x-session-id']);
+    expect(wbCommonHeaders('t', 'uid-2')['x-machine-id']).not.toBe(a['x-machine-id']);
+  });
+
+  it('没给 uid 时不带设备头（登录流程本身不需要）', () => {
+    expect(wbCommonHeaders('t')['x-machine-id']).toBeUndefined();
+  });
   it('给了 token 才带 Authorization', () => {
     expect(wbCommonHeaders()['authorization']).toBeUndefined();
     expect(wbCommonHeaders('tok')['authorization']).toBe('Bearer tok');

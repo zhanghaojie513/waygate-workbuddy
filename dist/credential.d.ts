@@ -44,8 +44,16 @@ export interface WbCredential {
 export declare function readSavedCredential(): WbCredential | null;
 /** 落盘（0600）。token 轮换后也调用本函数写回。 */
 export declare function saveCredential(cred: WbCredential): string;
-/** 登录态域通用出站头（OAuth 流程与活动接口共用）。 */
-export declare function wbCommonHeaders(token?: string): Record<string, string>;
+/**
+ * 登录态域通用出站头（OAuth 流程与活动接口共用）。
+ *
+ * ⚠️ 这些头不是可有可无的装饰 —— `x-codebuddy-request` 是**风控闸门头**
+ * （实测：缺它时签到/领取类端点被拒），`x-machine-id`/`x-session-id` 是设备标识
+ * （官方客户端有，缺失可能被当作异常来源）。三者缺一不可。
+ */
+export declare function wbCommonHeaders(token?: string, uid?: string): Record<string, string>;
+/** 按 uid 派生稳定设备标识（OAuth 登录态没有真实机器 ID，用确定性派生代替随机）。 */
+export declare function deriveStableId(uid: string, purpose: 'machine' | 'session'): string;
 /** 登录尚未完成（poll 时的正常待机状态，不是错误）。 */
 export declare class PendingLoginError extends Error {
     readonly name = "PendingLoginError";

@@ -76,8 +76,17 @@ export declare class WbActivity {
     /** 任务列表（只读）。 */
     panelTasks(): Promise<Array<Record<string, unknown>>>;
     /**
-     * 跑一轮任务：未接的先 accept，可领的 claim。
-     * 前置条件不满足 → `skipped`（**如实记录，不伪造行为**）。
+    /**
+     * 跑一轮任务：**对全部未锁定任务先 accept、再逐个 claim**，由上游语义分流结果。
+     *
+     * ⚠️ 为什么不「先筛出可领的再 claim」：实测（2026-10）任务响应里**没有**
+     * `claim_status` / `status` 这类「可领」字段 —— 只有 `accept_status`
+     * （取值 `accepted` / `claimed` / `in_progress`）与 `progress{current,target}`。
+     * 靠臆想的字段筛会**一个都筛不出来**（这正是上一版的 bug）。
+     * 正确做法：对每个任务都试 claim，让上游回答：
+     *   · 已领过 → 200 + `already_claimed:true`   → `already`
+     *   · 未完成 → 400 + `task not completed`     → `skipped`（等真实使用后再领）
+     *   · 成功   → 200 + `credit` / `energy`      → `claimed`
      */
     runTasks(): Promise<GrowthTaskOutcome[]>;
     /** 连登兑换：只对 `available` 的档发（7d/14d/28d）。 */
