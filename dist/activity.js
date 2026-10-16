@@ -15,6 +15,7 @@
  * 补登卡 / 抽奖 / 旅行属资源消耗型，**不自动化**。
  */
 import { randomUUID } from 'node:crypto';
+import { describeFetchError, fetchWithRetry } from 'waygate-core';
 import { UpstreamError } from './errors.js';
 import { wbCommonHeaders } from './credential.js';
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -56,12 +57,21 @@ export class WbActivity {
             throw new UpstreamError('未导入 WorkBuddy 登录态 —— 先跑 `wb login`。');
         const token = await this.getToken();
         const method = init.method ?? 'POST';
-        const res = await fetch(`${this.baseUrl}${path}`, {
-            method,
-            headers: { ...wbCommonHeaders(token, cred.uid), 'x-user-id': cred.uid },
-            ...(method === 'POST' ? { body: JSON.stringify(init.body ?? {}) } : {}),
-            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        });
+        /* ★ 走 fetchWithRetry：上游有间歇性连接超时，原来"打一次就完"会让用户偶发看到
+           `fetch failed`。只重试连接层失败（4xx 不重试，见 core retry.ts 注释）。
+           签到/领取上游自带幂等（重复领返回已领状态），故对 POST 重试也是安全的。 */
+        let res;
+        try {
+            res = await fetchWithRetry(`${this.baseUrl}${path}`, {
+                method,
+                headers: { ...wbCommonHeaders(token, cred.uid), 'x-user-id': cred.uid },
+                ...(method === 'POST' ? { body: JSON.stringify(init.body ?? {}) } : {}),
+            }, { timeoutMs: REQUEST_TIMEOUT_MS });
+        }
+        catch (err) {
+            /* 把 "fetch failed" 变成可行动的文案（带 cause 码）。 */
+            throw new UpstreamError(`连不上 WorkBuddy 上游（${describeFetchError(err)}）—— 网络抖动，请重试`);
+        }
         const text = await res.text().catch(() => '');
         let parsed;
         try {
